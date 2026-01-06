@@ -1,14 +1,13 @@
 import streamlit as st
 import pandas as pd
-import os
 from datetime import datetime
 from io import BytesIO
 
 st.set_page_config(page_title="Footwear Transfer Tool", layout="wide")
 st.title("Footwear Transfer Tool")
 
-# ---------------- CORE LOGIC (UNCHANGED) ----------------
-def process_file(df):
+def process_file_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    # ---------------- CLEAN & PREP ----------------
     df['Store'] = df['Store'].astype(str).str.strip()
 
     df['Level1_Key'] = (
@@ -18,6 +17,7 @@ def process_file(df):
     )
     df['Level2_Key'] = df['Level1_Key'] + ' - ' + df['Attribute 3'].astype(str).str.strip()
 
+    # ---------------- INVENTORY ----------------
     inventory = df.groupby(
         [
             'Store',
@@ -51,41 +51,56 @@ def process_file(df):
         inventory_dict[(from_store, level2_key)] -= 1
         inventory_dict[(to_store, level2_key)] = inventory_dict.get((to_store, level2_key), 0) + 1
 
+    # ---------------- LEVEL 1 HELPERS ----------------
     def get_level1_total(store, level1_key):
-        return sum(
-            qty for (s, l2k), qty in inventory_dict.items()
-            if s == store and qty > 0 and str(l2k).startswith(level1_key)
-        )
+        total = 0
+        for (s, l2k), qty in inventory_dict.items():
+            if s == store and qty > 0 and str(l2k).startswith(level1_key):
+                total += qty
+        return total
 
     def store_has_level1(store, level1_key):
         return get_level1_total(store, level1_key) > 0
 
     def get_best_donor_level1(target_store, level1_key):
-        candidates = [
-            (donor, get_level1_total(donor, level1_key))
-            for donor in all_locations
-            if donor != target_store and get_level1_total(donor, level1_key) > 1
-        ]
-        return max(candidates, key=lambda x: x[1])[0] if candidates else None
+        candidates = []
+        for donor in all_locations:
+            if donor == target_store:
+                continue
+            total = get_level1_total(donor, level1_key)
+            if total > 1:
+                candidates.append((donor, total))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: x[1])[0]
 
     def pick_level2_for_level1(donor, level1_key):
-        eligible = [
-            (l2k, qty)
-            for (s, l2k), qty in inventory_dict.items()
-            if s == donor and qty > 0 and str(l2k).startswith(level1_key)
-        ]
-        return max(eligible, key=lambda x: x[1])[0] if eligible else None
+        eligible = []
+        for (s, l2k), qty in inventory_dict.items():
+            if s == donor and qty > 0 and str(l2k).startswith(level1_key):
+                eligible.append((l2k, qty))
+        if not eligible:
+            return None
+        return max(eligible, key=lambda x: x[1])[0]
 
+    # ---------------- LEVEL 2 HELPER ----------------
     def get_best_donor_level2(target_store, level2_key):
         eligible = []
         for donor in all_locations:
             if donor == target_store:
                 continue
             qty = get_qty(donor, level2_key)
-            if (donor == warehouse and qty > 0) or (donor != warehouse and qty > 1):
-                eligible.append((donor, qty))
-        return max(eligible, key=lambda x: x[1])[0] if eligible else None
+            if donor == warehouse:
+                if qty > 0:
+                    eligible.append((donor, qty))
+            else:
+                if qty > 1:
+                    eligible.append((donor, qty))
+        if not eligible:
+            return None
+        return max(eligible, key=lambda x: x[1])[0]
 
+    # ---------------- TRANSFERS (raw rows, 1 row per unit) ----------------
     transfers = []
 
     unique_items = inventory[
@@ -103,76 +118,150 @@ def process_file(df):
 
     # -------- LEVEL 1 --------
     for _, item in unique_items.iterrows():
+        level1_key = item['Level1_Key']
+        matrix = item['Matrix']
+        sku = item['Manufacturer SKU']
+        size = item['Attribute 1']
+        width = item['Attribute 2']
+        brand = item['Brand']
+
         for store in stores:
-            if not store_has_level1(store, item['Level1_Key']):
-                donor = get_best_donor_level1(store, item['Level1_Key'])
+            if not store_has_level1(store, level1_key):
+                donor = get_best_donor_level1(store, level1_key)
                 if donor:
-                    chosen = pick_level2_for_level1(donor, item['Level1_Key'])
-                    if chosen:
+                    chosen_level2 = pick_level2_for_level1(donor, level1_key)
+                    if chosen_level2:
+                        color = str(chosen_level2).split(" - ")[-1]
                         transfers.append({
                             'From Store': donor,
                             'To Store': store,
-                            'Brand': item['Brand'],
-                            'Matrix': item['Matrix'],
-                            'Manufacturer SKU': item['Manufacturer SKU'],
-                            'Size': item['Attribute 1'],
-                            'Width': item['Attribute 2'],
-                            'Color': str(chosen).split(" - ")[-1],
+                            'Brand': brand,
+                            'Matrix': matrix,
+                            'Manufacturer SKU': sku,
+                            'Size': size,
+                            'Width': width,
+                            'Color': color,
                             'Level': '1'
                         })
-                        update_qty(donor, store, chosen)
+                        update_qty(donor, store, chosen_level2)
 
     # -------- LEVEL 2 --------
     for _, item in unique_items.iterrows():
+        level2_key = item['Level2_Key']
+        matrix = item['Matrix']
+        sku = item['Manufacturer SKU']
+        size = item['Attribute 1']
+        width = item['Attribute 2']
+        color = item['Attribute 3']
+        brand = item['Brand']
+
         for store in stores:
-            if get_qty(store, item['Level2_Key']) == 0:
-                donor = get_best_donor_level2(store, item['Level2_Key'])
+            if get_qty(store, level2_key) == 0:
+                donor = get_best_donor_level2(store, level2_key)
                 if donor:
                     transfers.append({
                         'From Store': donor,
                         'To Store': store,
-                        'Brand': item['Brand'],
-                        'Matrix': item['Matrix'],
-                        'Manufacturer SKU': item['Manufacturer SKU'],
-                        'Size': item['Attribute 1'],
-                        'Width': item['Attribute 2'],
-                        'Color': item['Attribute 3'],
+                        'Brand': brand,
+                        'Matrix': matrix,
+                        'Manufacturer SKU': sku,
+                        'Size': size,
+                        'Width': width,
+                        'Color': color,
                         'Level': '2'
                     })
-                    update_qty(donor, store, item['Level2_Key'])
+                    update_qty(donor, store, level2_key)
 
-    return pd.DataFrame(transfers)
+    if not transfers:
+        # Return empty df + empty tabs
+        empty = pd.DataFrame(columns=[
+            'From Store','To Store','Brand','Matrix','Manufacturer SKU',
+            'Size','Width','Color','Quantity to Transfer','Level'
+        ])
+        return empty, {loc.split(' - ')[-1].replace('/', '-'): empty.copy() for loc in all_locations}
+
+    # ---------------- OUTPUT (THIS IS THE PART YOU CALLED OUT) ----------------
+    transfer_df = pd.DataFrame(transfers)
+
+    group_cols = [
+        'From Store',
+        'To Store',
+        'Brand',
+        'Matrix',
+        'Manufacturer SKU',
+        'Size',
+        'Width',
+        'Color',
+        'Level'
+    ]
+
+    # ✅ YOUR MISSING LOGIC: quantity = count of unit rows
+    transfer_df['Quantity to Transfer'] = (
+        transfer_df.groupby(group_cols)['From Store'].transform('count')
+    )
+
+    # ✅ de-dupe so each combo appears once with quantity
+    transfer_df = transfer_df.drop_duplicates(subset=group_cols)
+
+    # ✅ column order
+    transfer_df = transfer_df[
+        [
+            'From Store',
+            'To Store',
+            'Brand',
+            'Matrix',
+            'Manufacturer SKU',
+            'Size',
+            'Width',
+            'Color',
+            'Quantity to Transfer',
+            'Level'
+        ]
+    ]
+
+    # ✅ Store tabs for all locations (even empty)
+    store_tabs = {}
+    for store in all_locations:
+        tab = transfer_df[transfer_df['From Store'] == store].copy()
+        tab = tab.sort_values(
+            by=['Brand', 'Matrix', 'Manufacturer SKU', 'Width', 'Color', 'Size']
+        ).reset_index(drop=True)
+        tab_name = store.split(' - ')[-1].replace('/', '-')
+        store_tabs[tab_name] = tab
+
+    return transfer_df, store_tabs
 
 # ---------------- STREAMLIT UI ----------------
-uploaded_file = st.file_uploader(
-    "Upload Inventory CSV",
-    type=["csv"]
-)
+uploaded_file = st.file_uploader("Upload Inventory CSV", type=["csv"])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
 
     with st.spinner("Running Footwear Transfer…"):
-        transfer_df = process_file(df)
+        transfer_df, store_tabs = process_file_df(df)
 
     if transfer_df.empty:
         st.info("No transfers were generated.")
     else:
-        st.success("Transfers generated!")
+        st.success(f"Transfers generated: {len(transfer_df)} grouped lines")
 
-        output = BytesIO()
-        today = datetime.today().strftime('%Y-%m-%d')
+        st.subheader("Preview (Grouped Transfers)")
+        st.dataframe(transfer_df, use_container_width=True)
 
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            for store in transfer_df['From Store'].unique():
-                tab = transfer_df[transfer_df['From Store'] == store]
-                tab_name = store.split(' - ')[-1].replace('/', '-')
-                tab.to_excel(writer, sheet_name=tab_name, index=False)
-                writer.sheets[tab_name].freeze_panes(1, 0)
+    # Build Excel in-memory (download)
+    output = BytesIO()
+    today = datetime.today().strftime('%Y-%m-%d')
 
-        st.download_button(
-            label="Download Transfer File",
-            data=output.getvalue(),
-            file_name=f"Footwear_Transfer_{today}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        for tab_name, tab_df in store_tabs.items():
+            tab_df.to_excel(writer, sheet_name=tab_name[:31], index=False)
+            writer.sheets[tab_name[:31]].freeze_panes(1, 0)
+
+    st.download_button(
+        label="Download Transfer File (Excel)",
+        data=output.getvalue(),
+        file_name=f"Footwear_Transfer_{today}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+else:
+    st.caption("Upload your inventory CSV to generate transfers.")
